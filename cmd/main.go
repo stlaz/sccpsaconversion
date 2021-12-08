@@ -24,7 +24,7 @@ const (
 
 func main() {
 	if len(os.Args) != 3 {
-		fmt.Fprintf(os.Stderr, "expecting two arguments: ./sccpsaconversion namespace sccName")
+		fmt.Fprintf(os.Stderr, "expecting two arguments: ./sccpsaconversion namespace sccName\n")
 		os.Exit(1)
 	}
 	requiredNamespace := os.Args[1]
