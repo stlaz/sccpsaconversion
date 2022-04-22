@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -17,7 +19,8 @@ import (
 )
 
 const (
-	restricted uint8 = iota
+	unknown uint8 = iota
+	restricted
 	baseline
 	privileged
 )
@@ -56,10 +59,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	conversionNS, err := coreClient.Namespaces().Get(context.Background(), requiredNamespace, metav1.GetOptions{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to retrieve the conversion namespace: %v", err)
+		os.Exit(1)
+	}
+
+	psaLevel, err := convertSCCToPSALevel(conversionNS, convertedSCC)
+
 	fmt.Printf("===============\nminimum possible restrictivness level: %s\n",
-		internalRestrictivnessToString(
-			convertSCCToPSALevel(coreClient, requiredNamespace, convertedSCC),
-		),
+		internalRestrictivnessToString(psaLevel),
 	)
 }
 
@@ -76,20 +85,26 @@ func internalRestrictivnessToString(restr uint8) string {
 	}
 }
 
-func convertSCCToPSALevel(coreClient corev1client.CoreV1Interface, namespace string, scc *securityv1.SecurityContextConstraints) uint8 {
+func convertSCCToPSALevel(namespace *corev1.Namespace, scc *securityv1.SecurityContextConstraints) (uint8, error) {
 	sccRestrictivness := make([]uint8, 0, 10)
 	sccRestrictivness = append(sccRestrictivness,
-		logAndForward("convert_hostDir", convert_hostDir(scc.AllowHostDirVolumePlugin, scc.Volumes)),
-		logAndForward("convert_hostNamespace", convert_hostNamespace(scc.AllowHostIPC, scc.AllowHostNetwork, scc.AllowHostPID)),
-		logAndForward("convert_hostPorts", convert_hostPorts(scc.AllowHostPorts)),
-		logAndForward("convert_allowPrivilegeEscalation", convert_allowPrivilegeEscalation(scc.AllowPrivilegeEscalation, scc.DefaultAllowPrivilegeEscalation)),
-		logAndForward("convert_allowPrivilegedContainer", convert_allowPrivilegedContainer(scc.AllowPrivilegedContainer)),
-		logAndForward("convert_allowedCapabilities", convert_allowedCapabilities(scc.AllowedCapabilities, scc.RequiredDropCapabilities)),
-		logAndForward("convert_unsafeSysctls", convert_unsafeSysctls(scc.AllowedUnsafeSysctls)),
-		logAndForward("convert_runAsUserOrDie", convert_runAsUserOrDie(coreClient.Namespaces(), namespace, &scc.RunAsUser)),
-		logAndForward("convert_volumes", convert_volumes(scc.Volumes)),
-		logAndForward("convert_seLinuxOptions", convert_seLinuxOptions(&scc.SELinuxContext)),
+		convert_hostDir(scc.AllowHostDirVolumePlugin, scc.Volumes),
+		convert_hostNamespace(scc.AllowHostIPC, scc.AllowHostNetwork, scc.AllowHostPID),
+		convert_hostPorts(scc.AllowHostPorts),
+		convert_allowPrivilegeEscalation(scc.AllowPrivilegeEscalation, scc.DefaultAllowPrivilegeEscalation),
+		convert_allowPrivilegedContainer(scc.AllowPrivilegedContainer),
+		convert_allowedCapabilities(scc.AllowedCapabilities, scc.RequiredDropCapabilities),
+		convert_unsafeSysctls(scc.AllowedUnsafeSysctls),
+		convert_volumes(scc.Volumes),
+		convert_seLinuxOptions(&scc.SELinuxContext),
+		convert_seccompProfile(scc.SeccompProfiles),
 	)
+
+	if restrictivness, err := convert_runAsUserOrDie(namespace, &scc.RunAsUser); err != nil {
+		return privileged, fmt.Errorf("failed to convert SCC %q in namespace %q: %w", scc.Name, namespace.Name, err)
+	} else {
+		sccRestrictivness = append(sccRestrictivness, restrictivness)
+	}
 
 	// scc.ForbiddenSysctls <-- only restricts the current allowed set, unused for conversion
 	// scc.AllowedFlexVolumes <-- only restricts the current allowed set, unused for conversion
@@ -100,24 +115,17 @@ func convertSCCToPSALevel(coreClient corev1client.CoreV1Interface, namespace str
 	// scc.ReadOnlyRootFilesystem <-- seems to be ignored by PSa
 	// scc.SupplementalGroups <-- seems to be ignored by PSa
 
-	// scc.SeccompProfiles <-- FIXME: this matured to GA in kube but is not reflected to SCCs
-
 	var restrictiveness = restricted
 	for _, r := range sccRestrictivness {
 		if r == privileged {
-			return privileged
+			return privileged, nil
 		}
 
 		if r > restrictiveness {
 			restrictiveness = r
 		}
 	}
-	return restrictiveness
-}
-
-func logAndForward(conversionName string, restrictivness uint8) uint8 {
-	fmt.Printf("converting %s sets level: %s\n", conversionName, internalRestrictivnessToString(restrictivness))
-	return restrictivness
+	return restrictiveness, nil
 }
 
 func convert_hostDir(allowHostDirVolumePlugin bool, volumes []securityv1.FSType) uint8 {
@@ -180,15 +188,12 @@ func convert_allowPrivilegedContainer(allowPrivilegedContainer bool) uint8 {
 	return restricted
 }
 
-// FIXME: <needs a fix in OCP>
-// this single conversion will make all SCCs be evaluated as `baseline` at best
-// since we don't currently have a way to require dropping ALL caps in OCP
 func convert_allowedCapabilities(sccAllowedCapabilities, requiredDropCapabilities []corev1.Capability) uint8 {
 	// upstream: check_capabilities_{baseline,restricted}
 	// baseline allows:  `baseline_capabilities_allowed_1_0`
 	// restricted:
 	//     allows: NET_BIND_SERVICE
-	//     requires: drop ALL <-- ALL is missing in OpenShift
+	//     requires: drop ALL
 	baseline_capabilities_allowed_1_0 := sets.NewString(
 		"AUDIT_WRITE",
 		"CHOWN",
@@ -214,16 +219,23 @@ func convert_allowedCapabilities(sccAllowedCapabilities, requiredDropCapabilitie
 		return privileged
 	}
 
-	// we will always return baseline after this point because we have no way
-	// to request dropping ALL caps as upstream does as ALL does not exist in
-	// OCP
-	// Still, this condition is to be found in the upstream code so it might
-	// be worth keeping in case OCP gets fixed
-	if !sccAllowed.Equal(sets.NewString("NET_BIND_SERVICE")) {
+	// restricted conditions below
+	if !sets.NewString("NET_BIND_SERVICE").IsSuperset(sccAllowed) {
 		return baseline
 	}
 
-	return baseline
+	var dropsAll bool
+	for _, cap := range requiredDropCapabilities {
+		if cap == "ALL" {
+			dropsAll = true
+			break
+		}
+	}
+	if !dropsAll {
+		return baseline
+	}
+
+	return restricted
 }
 
 func convert_unsafeSysctls(allowedUnsafeSysctls []string) uint8 {
@@ -248,57 +260,51 @@ func convert_unsafeSysctls(allowedUnsafeSysctls []string) uint8 {
 	return restricted
 }
 
-// INTERESTING: this function makes the whole conversion NS-dependant
 func convert_runAsUserOrDie(
-	nsClient corev1client.NamespaceInterface,
-	namespace string,
+	namespace *corev1.Namespace,
 	runAsUser *securityv1.RunAsUserStrategyOptions,
-) uint8 {
+) (uint8, error) {
 	// upstream: check_runAsUser
 	// restricted requires: non-zero, undefined
 	switch runAsUser.Type {
 	case securityv1.RunAsUserStrategyMustRunAsNonRoot:
-		return restricted
+		return restricted, nil
 	case securityv1.RunAsUserStrategyMustRunAs:
 		// RunAsUserStrategyMustRunAs requires the UID to be set
 		if runAsUser.UID != nil && *runAsUser.UID > 0 {
-			return restricted
+			return restricted, nil
 		}
-		return baseline
+		return baseline, nil
 	case securityv1.RunAsUserStrategyMustRunAsRange:
 		if runAsUser.UIDRangeMin == nil || runAsUser.UIDRangeMax == nil {
-			ns, err := nsClient.Get(context.Background(), namespace, metav1.GetOptions{})
-			if err != nil {
-				panic(fmt.Errorf("failed to get namespace %q: %v", namespace, err))
-			}
-			annotationVal, ok := ns.Annotations[securityv1.UIDRangeAnnotation]
+			annotationVal, ok := namespace.Annotations[securityv1.UIDRangeAnnotation]
 			if !ok || len(annotationVal) == 0 {
-				panic(fmt.Errorf("the namespace %q has no valid %q label or the label's missing value, even though the SCC requires it", namespace, securityv1.UIDRangeAnnotation))
+				return unknown, fmt.Errorf("the namespace %q has no valid %q label or the label's missing value, even though the SCC requires it", namespace, securityv1.UIDRangeAnnotation)
 			}
 
 			uidBlock, err := uid.ParseBlock(annotationVal)
 			if err != nil {
-				panic(fmt.Errorf("failed to parse uid block for the %q namespace: %v", namespace, err))
+				return unknown, fmt.Errorf("failed to parse uid block for the %q namespace: %v", namespace, err)
 			}
 
 			if uidBlock.Start > 0 { // we only care about the beginning of the block, no need to check for valid blocks here
-				return restricted
+				return restricted, nil
 			}
 
-			return baseline
+			return baseline, nil
 		}
 
 		// we only care about the beginning of the block, no need to check for valid blocks here
 		if *runAsUser.UIDRangeMin > 0 {
-			return restricted
+			return restricted, nil
 		}
 
-		return baseline
+		return baseline, nil
 
 	case securityv1.RunAsUserStrategyRunAsAny:
-		return baseline
+		return baseline, nil
 	default:
-		panic(fmt.Errorf("unknown strategy: %s", runAsUser.Type))
+		return unknown, fmt.Errorf("unknown strategy: %s", runAsUser.Type)
 	}
 
 }
@@ -415,6 +421,51 @@ func convert_seLinuxOptions(opts *securityv1.SELinuxContextStrategyOptions) uint
 
 	if len(opts.SELinuxOptions.Role) > 0 {
 		return privileged
+	}
+
+	return restricted
+}
+
+// INTERESTING: OpenShift does not allow localhost wildcards, only exact matches
+func convert_seccompProfile(profiles []string) uint8 {
+	// upstream: check_seccompProfile
+	// baseline:
+	//    allows(1.0) (annotation values):
+	//      'runtime/default'
+	//      'docker/default'
+	//      'localhost/*'
+	//      undefined
+	//    allows(1.19) (field values - type):
+	//      RuntimeDefault
+	//      LocalHost
+	//      undefined
+	// restricted:
+	//    allows (field values - type):
+	//      RuntimeDefault
+	//      Localhost
+
+	// only allows
+	if len(profiles) == 0 {
+		return baseline
+	}
+
+	// Valid profiles are the same for baseline and restricted, although restricted
+	// allows setting the fields only, which we have no way to ensure.
+	// Just being able to restrict the profile should be enough, though.
+	validProfile := func(p string) bool {
+		if p == v1.DeprecatedSeccompProfileDockerDefault ||
+			p == v1.SeccompProfileRuntimeDefault ||
+			strings.HasPrefix(p, corev1.SeccompLocalhostProfileNamePrefix) {
+			return true
+		}
+
+		return false
+	}
+
+	for _, p := range profiles {
+		if !validProfile(p) {
+			return privileged
+		}
 	}
 
 	return restricted
