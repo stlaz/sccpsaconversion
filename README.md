@@ -1,3 +1,1 @@
-TODO:
-- add a Makefile target to validate that there were no changes to the checks
-  upstream and so that the conversion code does not need to be updated
+This repository is now a part of SCC conversion of the openshift/cluster-policy-controller: https://github.com/openshift/cluster-policy-controller/
